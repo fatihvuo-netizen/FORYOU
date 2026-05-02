@@ -1,9 +1,16 @@
 // Chihab AI - Gemini Vercel serverless endpoint
 // Required Vercel Environment Variable: GEMINI_API_KEY
 // Optional Vercel Environment Variable: GEMINI_MODEL
-// Default model: gemini-1.5-flash
+// Recommended optional value: gemini-2.0-flash
 
-const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const PREFERRED_MODELS = [
+  process.env.GEMINI_MODEL,
+  'gemini-2.0-flash',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-1.5-flash-latest',
+  'gemini-1.5-flash'
+].filter(Boolean);
 
 function sendJson(res, status, body) {
   res.statusCode = status;
@@ -175,9 +182,53 @@ function buildPrompt({ message, menu, language }) {
   ].join('\n');
 }
 
-async function callGemini({ apiKey, prompt }) {
+async function listUsableGeminiModels(apiKey) {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`
+    );
+
+    const raw = await response.text();
+
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!response.ok || !Array.isArray(data?.models)) {
+      return [];
+    }
+
+    return data.models
+      .filter(model =>
+        Array.isArray(model.supportedGenerationMethods) &&
+        model.supportedGenerationMethods.includes('generateContent')
+      )
+      .map(model => String(model.name || '').replace(/^models\//, ''))
+      .filter(Boolean)
+      .sort((a, b) => {
+        const score = name => {
+          if (name.includes('2.0-flash')) return 1;
+          if (name.includes('2.5-flash')) return 2;
+          if (name.includes('flash')) return 3;
+          if (name.includes('pro')) return 4;
+          return 9;
+        };
+
+        return score(a) - score(b);
+      });
+  } catch {
+    return [];
+  }
+}
+
+async function tryGeminiModel({ apiKey, model, prompt }) {
+  const cleanModel = String(model).replace(/^models\//, '');
+
   const endpoint =
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const response = await fetch(endpoint, {
     method: 'POST',
@@ -214,7 +265,7 @@ async function callGemini({ apiKey, prompt }) {
       raw ||
       `HTTP ${response.status}`;
 
-    throw new Error(detail);
+    throw new Error(`${cleanModel}: ${detail}`);
   }
 
   const answer =
@@ -224,6 +275,37 @@ async function callGemini({ apiKey, prompt }) {
       .trim() || '';
 
   return answer;
+}
+
+async function callGemini({ apiKey, prompt }) {
+  const availableModels = await listUsableGeminiModels(apiKey);
+
+  const modelsToTry = [
+    ...PREFERRED_MODELS,
+    ...availableModels
+  ]
+    .map(model => String(model).replace(/^models\//, ''))
+    .filter(Boolean)
+    .filter((model, index, arr) => arr.indexOf(model) === index);
+
+  let lastError = null;
+
+  for (const model of modelsToTry) {
+    try {
+      const answer = await tryGeminiModel({ apiKey, model, prompt });
+
+      if (answer) {
+        return answer;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(
+    lastError?.message ||
+    'No usable Gemini model was found for this API key.'
+  );
 }
 
 module.exports = async function handler(req, res) {
