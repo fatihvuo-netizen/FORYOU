@@ -1,0 +1,13 @@
+{
+  "name": "foryou-restaurant-webapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "For You Restaurant web app with secure Chihab AI Claude serverless endpoint.",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
