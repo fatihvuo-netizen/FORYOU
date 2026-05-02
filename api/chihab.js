@@ -2,7 +2,7 @@
 // Required environment variable in Vercel: ANTHROPIC_API_KEY
 // Optional environment variable: CLAUDE_MODEL, e.g. claude-3-5-haiku-latest
 
-const DEFAULT_MODEL = 'claude-3-5-haiku-latest';
+const DEFAULT_MODEL = 'claude-3-haiku-20240307';
 const MAX_MENU_ITEMS = 220;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_CONTENT_CHARS = 900;
