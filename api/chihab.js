@@ -1,8 +1,9 @@
-// Chihab AI - final robust Vercel serverless endpoint
-// Required Vercel Environment Variable: ANTHROPIC_API_KEY
-// Optional: CLAUDE_MODEL
+// Chihab AI - Gemini Vercel serverless endpoint
+// Required Vercel Environment Variable: GEMINI_API_KEY
+// Optional Vercel Environment Variable: GEMINI_MODEL
+// Default model: gemini-1.5-flash
 
-const MODEL = process.env.CLAUDE_MODEL || 'claude-3-haiku-20240307';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
 function sendJson(res, status, body) {
   res.statusCode = status;
@@ -27,6 +28,7 @@ async function readBody(req) {
 
     req.on('data', chunk => {
       data += chunk;
+
       if (data.length > 300000) {
         reject(new Error('Request body too large'));
         req.destroy();
@@ -54,7 +56,11 @@ function toText(value, max = 1200) {
   }
 
   if (Array.isArray(value)) {
-    return value.map(v => toText(v, max)).filter(Boolean).join('\n').slice(0, max);
+    return value
+      .map(item => toText(item, max))
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, max);
   }
 
   if (typeof value === 'object') {
@@ -110,12 +116,19 @@ function buildMenuText(menu) {
       if (!name) return '';
 
       const category = toText(item?.category, 50);
+
       const price = Number.isFinite(Number(item?.price))
         ? `${Number(item.price)} MAD`
         : 'price not provided';
+
       const ingredients = Array.isArray(item?.ingredients)
-        ? item.ingredients.slice(0, 8).map(x => toText(x, 30)).filter(Boolean).join(', ')
+        ? item.ingredients
+            .slice(0, 8)
+            .map(x => toText(x, 30))
+            .filter(Boolean)
+            .join(', ')
         : '';
+
       const desc = toText(item?.desc || item?.description, 120);
       const availability = item?.available === false ? 'UNAVAILABLE' : 'AVAILABLE';
 
@@ -147,12 +160,78 @@ function basicFallback(message) {
   return 'I can help you choose from the For You menu. Tell me your budget, what you like, and what you want to avoid.';
 }
 
+function buildPrompt({ message, menu, language }) {
+  return [
+    'You are Chihab, a warm and concise AI assistant for For You Restaurant in Ifrane, Morocco.',
+    `Reply in ${toText(language, 40) || 'English'} unless the customer clearly uses another language.`,
+    'Recommend only from the provided menu. Do not invent dishes, prices, ingredients, promotions, or hours.',
+    'Restaurant hours: opens 3 PM daily. Closes 12:30 AM Mon-Thu, 1 AM Sunday, 2 AM Fri-Sat.',
+    'Payment: cash or card at delivery. Prices are in MAD.',
+    'Keep replies short and practical. For recommendations, suggest 2 to 4 items with brief reasons.',
+    '',
+    `MENU:\n${menu}`,
+    '',
+    `CUSTOMER MESSAGE:\n${message}`
+  ].join('\n');
+}
+
+async function callGemini({ apiKey, prompt }) {
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.45,
+        maxOutputTokens: 350
+      }
+    })
+  });
+
+  const raw = await response.text();
+
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const detail =
+      data?.error?.message ||
+      data?.error?.status ||
+      raw ||
+      `HTTP ${response.status}`;
+
+    throw new Error(detail);
+  }
+
+  const answer =
+    data?.candidates?.[0]?.content?.parts
+      ?.map(part => part?.text || '')
+      .join('\n')
+      .trim() || '';
+
+  return answer;
+}
+
 module.exports = async function handler(req, res) {
-  // This fixes the GET 405 issue.
   if (req.method === 'GET') {
     return sendJson(res, 200, {
       ok: true,
-      route: 'Chihab API is live. The browser test works. The chat should send POST requests.'
+      provider: 'Gemini',
+      route: 'Chihab API is live. The browser test works. The chat sends POST requests.'
     });
   }
 
@@ -182,76 +261,30 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     return sendJson(res, 200, {
-      text: 'Chihab AI is not configured yet. Add ANTHROPIC_API_KEY in Vercel Environment Variables, then redeploy.'
+      text: 'Chihab AI is not configured yet. Add GEMINI_API_KEY in Vercel Environment Variables, then redeploy.'
     });
   }
 
-  const system = [
-    'You are Chihab, a warm and concise AI assistant for For You Restaurant in Ifrane, Morocco.',
-    'Recommend only from the provided menu. Do not invent dishes, prices, ingredients, promotions, or hours.',
-    'Restaurant hours: opens 3 PM daily. Closes 12:30 AM Mon-Thu, 1 AM Sunday, 2 AM Fri-Sat.',
-    'Payment: cash or card at delivery. Prices are in MAD.',
-    'Keep replies short and practical. For recommendations, suggest 2 to 4 items with brief reasons.',
-    '',
-    `MENU:\n${buildMenuText(body?.menu)}`
-  ].join('\n');
+  const menu = buildMenuText(body?.menu);
+  const prompt = buildPrompt({
+    message,
+    menu,
+    language: body?.language
+  });
 
   try {
-    const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 350,
-        temperature: 0.4,
-        system,
-        messages: [
-          {
-            role: 'user',
-            content: message
-          }
-        ]
-      })
-    });
-
-    const raw = await claudeResponse.text();
-
-    let data = null;
-    try {
-      data = raw ? JSON.parse(raw) : null;
-    } catch {
-      data = null;
-    }
-
-    if (!claudeResponse.ok) {
-      const detail = data?.error?.message || raw || `HTTP ${claudeResponse.status}`;
-      return sendJson(res, 200, {
-        text: `Claude is reachable but rejected the request: ${detail}`
-      });
-    }
-
-    const answer = Array.isArray(data?.content)
-      ? data.content
-          .filter(block => block?.type === 'text')
-          .map(block => block.text)
-          .join('\n')
-          .trim()
-      : '';
+    const answer = await callGemini({ apiKey, prompt });
 
     return sendJson(res, 200, {
       text: answer || basicFallback(message)
     });
-  } catch {
+  } catch (error) {
     return sendJson(res, 200, {
-      text: basicFallback(message)
+      text: `Gemini is reachable but rejected the request: ${error.message || error}`
     });
   }
 };
