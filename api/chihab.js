@@ -1,159 +1,207 @@
-// Vercel Serverless Function for Chihab AI
-// Required environment variable in Vercel: ANTHROPIC_API_KEY
-// Optional environment variable: CLAUDE_MODEL, e.g. claude-3-5-haiku-latest
+// Chihab AI - final robust Vercel serverless endpoint
+// Required Vercel Environment Variable: ANTHROPIC_API_KEY
+// Optional: CLAUDE_MODEL
 
-const DEFAULT_MODEL = 'claude-3-haiku-20240307';
-const MAX_MENU_ITEMS = 220;
-const MAX_HISTORY_MESSAGES = 12;
-const MAX_CONTENT_CHARS = 900;
+const MODEL = process.env.CLAUDE_MODEL || 'claude-3-haiku-20240307';
 
-function sendJson(res, statusCode, body) {
-  res.statusCode = statusCode;
+function sendJson(res, status, body) {
+  res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.setHeader('cache-control', 'no-store');
   res.end(JSON.stringify(body));
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    if (req.body && typeof req.body === 'object') return resolve(req.body);
-    if (typeof req.body === 'string') {
-      try { return resolve(JSON.parse(req.body)); } catch (err) { return reject(err); }
-    }
+async function readBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
 
-    let raw = '';
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return { message: req.body };
+    }
+  }
+
+  const raw = await new Promise((resolve, reject) => {
+    let data = '';
+
     req.on('data', chunk => {
-      raw += chunk;
-      if (raw.length > 400_000) {
+      data += chunk;
+      if (data.length > 300000) {
         reject(new Error('Request body too large'));
         req.destroy();
       }
     });
-    req.on('end', () => {
-      if (!raw) return resolve({});
-      try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
-    });
+
+    req.on('end', () => resolve(data));
     req.on('error', reject);
   });
-}
 
-function text(value, max = MAX_CONTENT_CHARS) {
-  return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
-}
+  if (!raw) return {};
 
-function sanitizeHistory(history) {
-  const out = [];
-  for (const m of Array.isArray(history) ? history : []) {
-    const role = m?.role === 'assistant' ? 'assistant' : 'user';
-    const content = text(m?.content);
-    if (!content) continue;
-    if (out.length && out[out.length - 1].role === role) {
-      out[out.length - 1].content += '\n' + content;
-    } else {
-      out.push({ role, content });
-    }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { message: raw };
   }
-  while (out.length && out[0].role !== 'user') out.shift();
-  return out.slice(-MAX_HISTORY_MESSAGES);
 }
 
-function sanitizeMenu(menu) {
-  return (Array.isArray(menu) ? menu : [])
-    .slice(0, MAX_MENU_ITEMS)
-    .map(item => ({
-      id: text(item?.id, 80),
-      name: text(item?.name, 120),
-      category: text(item?.category, 80),
-      price: Number.isFinite(Number(item?.price)) ? Number(item.price) : null,
-      prep: text(item?.prep, 60),
-      ingredients: Array.isArray(item?.ingredients) ? item.ingredients.slice(0, 12).map(x => text(x, 40)).filter(Boolean) : [],
-      desc: text(item?.desc, 220),
-      available: item?.available !== false
-    }))
-    .filter(item => item.id && item.name && item.price !== null);
+function toText(value, max = 1200) {
+  if (value == null) return '';
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value).replace(/\s+/g, ' ').trim().slice(0, max);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(v => toText(v, max)).filter(Boolean).join('\n').slice(0, max);
+  }
+
+  if (typeof value === 'object') {
+    return toText(
+      value.text ||
+      value.content ||
+      value.message ||
+      value.value ||
+      '',
+      max
+    );
+  }
+
+  return '';
 }
 
-function buildPrompt({ language, menu, analytics }) {
-  const compactMenu = menu
-    .map(item => `${item.available ? 'AVAILABLE' : 'UNAVAILABLE'} | ${item.name} | ${item.category} | ${item.price} MAD | ${item.ingredients.join(', ')} | ${item.desc}`)
+function extractMessage(body) {
+  const candidates = [
+    body?.message,
+    body?.prompt,
+    body?.text,
+    body?.input,
+    body?.question,
+    body?.userMessage,
+    body?.content,
+    body?.query,
+    body?.contents?.[0]?.parts,
+    Array.isArray(body?.messages)
+      ? body.messages[body.messages.length - 1]?.content
+      : '',
+    Array.isArray(body?.history)
+      ? body.history[body.history.length - 1]?.content
+      : ''
+  ];
+
+  for (const candidate of candidates) {
+    const msg = toText(candidate, 1200);
+    if (msg) return msg;
+  }
+
+  return '';
+}
+
+function buildMenuText(menu) {
+  if (!Array.isArray(menu) || menu.length === 0) {
+    return 'No menu data was sent by the website.';
+  }
+
+  return menu
+    .slice(0, 120)
+    .map(item => {
+      const name = toText(item?.name, 80);
+      if (!name) return '';
+
+      const category = toText(item?.category, 50);
+      const price = Number.isFinite(Number(item?.price))
+        ? `${Number(item.price)} MAD`
+        : 'price not provided';
+      const ingredients = Array.isArray(item?.ingredients)
+        ? item.ingredients.slice(0, 8).map(x => toText(x, 30)).filter(Boolean).join(', ')
+        : '';
+      const desc = toText(item?.desc || item?.description, 120);
+      const availability = item?.available === false ? 'UNAVAILABLE' : 'AVAILABLE';
+
+      return `${availability} | ${name} | ${category} | ${price} | ${ingredients} | ${desc}`;
+    })
+    .filter(Boolean)
     .join('\n');
+}
 
-  const topItems = Array.isArray(analytics?.topItems)
-    ? analytics.topItems.slice(0, 5).map(x => `${text(x?.name, 80)} (${Number(x?.qty || 0)} orders)`).filter(Boolean).join(', ')
-    : '';
+function basicFallback(message) {
+  const m = message.toLowerCase();
 
-  return [
-    'You are Chihab, the warm and conversational AI assistant for "For You Restaurant" in Ifrane, Morocco.',
-    '',
-    `LANGUAGE: Reply in ${text(language, 40) || 'English'} unless the customer clearly writes in another language.`,
-    '',
-    'RESTAURANT INFO:',
-    '- Opens at 3 PM every day.',
-    '- Closes 12:30 AM Mon-Thu, 1 AM Sunday, 2 AM Fri-Sat.',
-    '- Payment: cash or card at delivery. Prices are in Moroccan dirhams (MAD).',
-    '',
-    `MENU (${menu.length} items):`,
-    compactMenu || 'No menu was provided by the app.',
-    '',
-    `ANALYTICS - most ordered: ${topItems || 'No order history yet'}`,
-    '',
-    'RULES:',
-    '- Recommend ONLY items from the MENU, using exact names and prices.',
-    '- Never invent dishes, prices, ingredients, promotions, opening hours, or unavailable options.',
-    '- Skip UNAVAILABLE items and suggest available alternatives.',
-    '- Respect restrictions: no cheese, no shrimp, no meat, budget, spicy, sweet, salty, filling, sushi, drinks, desserts.',
-    '- For greetings, reply naturally and briefly.',
-    '- For food advice, give 2 to 4 suggestions with a short reason each.',
-    '- Never output JSON, code blocks, markdown tables, or technical implementation text.',
-    '- Keep answers friendly, useful, and concise.'
-  ].join('\n');
+  if (m.includes('hi') || m.includes('hello') || m.includes('salut') || m.includes('salam')) {
+    return 'Hi, welcome to For You Restaurant. Tell me your budget, what you like, or what you want to avoid, and I will suggest something from the menu.';
+  }
+
+  if (m.includes('hour') || m.includes('open') || m.includes('close')) {
+    return 'For You opens at 3 PM every day. It closes at 12:30 AM from Monday to Thursday, 1 AM on Sunday, and 2 AM on Friday and Saturday.';
+  }
+
+  if (m.includes('chicken')) {
+    return 'For chicken options, tell me your budget and whether you want something light or filling. You can also check the Menu tab for the exact available chicken items and prices.';
+  }
+
+  if (m.includes('cheese')) {
+    return 'Got it — no cheese. Tell me your budget and what type of food you want, and I will help narrow it down.';
+  }
+
+  return 'I can help you choose from the For You menu. Tell me your budget, what you like, and what you want to avoid.';
 }
 
 module.exports = async function handler(req, res) {
-  if (req.method === 'OPTIONS') return sendJson(res, 200, { ok: true });
-  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed. Use POST.' });
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return sendJson(res, 500, { error: 'Chihab AI is not configured. Add ANTHROPIC_API_KEY in your deployment environment variables.' });
+  // This fixes the GET 405 issue.
+  if (req.method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      route: 'Chihab API is live. The browser test works. The chat should send POST requests.'
+    });
   }
 
-  let body;
+  if (req.method === 'OPTIONS') {
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method !== 'POST') {
+    return sendJson(res, 200, {
+      text: 'Chihab API is live. Please use the chat box on the website.'
+    });
+  }
+
+  let body = {};
+
   try {
     body = await readBody(req);
-  } catch (_) {
-    return sendJson(res, 400, { error: 'Invalid JSON request.' });
+  } catch {
+    body = {};
   }
 
-  const message = text(
-    body?.message ||
-    body?.prompt ||
-    body?.text ||
-    body?.input ||
-    body?.question ||
-    body?.userMessage ||
-    body?.contents?.[0]?.parts?.map(p => p.text).join('\n') ||
-    body?.messages?.[body.messages.length - 1]?.content ||
+  const message = extractMessage(body);
+
+  if (!message) {
+    return sendJson(res, 200, {
+      text: 'I did not receive your message. Please type it again in the chat box.'
+    });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+
+  if (!apiKey) {
+    return sendJson(res, 200, {
+      text: 'Chihab AI is not configured yet. Add ANTHROPIC_API_KEY in Vercel Environment Variables, then redeploy.'
+    });
+  }
+
+  const system = [
+    'You are Chihab, a warm and concise AI assistant for For You Restaurant in Ifrane, Morocco.',
+    'Recommend only from the provided menu. Do not invent dishes, prices, ingredients, promotions, or hours.',
+    'Restaurant hours: opens 3 PM daily. Closes 12:30 AM Mon-Thu, 1 AM Sunday, 2 AM Fri-Sat.',
+    'Payment: cash or card at delivery. Prices are in MAD.',
+    'Keep replies short and practical. For recommendations, suggest 2 to 4 items with brief reasons.',
     '',
-    1200
-  );
-  const menu = sanitizeMenu(body?.menu);
-  const history = sanitizeHistory(body?.history || body?.messages || []);
+    `MENU:\n${buildMenuText(body?.menu)}`
+  ].join('\n');
 
-  if (!message) return sendJson(res, 400, { error: 'Missing message.' });
-  if (!history.length || history[history.length - 1].content !== message) {
-    history.push({ role: 'user', content: message });
-  }
-
-  const system = buildPrompt({
-    language: body?.language,
-    menu,
-    analytics: body?.analytics
-  });
-
-  let anthropicResponse;
   try {
-    anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -161,31 +209,49 @@ module.exports = async function handler(req, res) {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: process.env.CLAUDE_MODEL || DEFAULT_MODEL,
-        max_tokens: 520,
-        temperature: 0.55,
+        model: MODEL,
+        max_tokens: 350,
+        temperature: 0.4,
         system,
-        messages: history
+        messages: [
+          {
+            role: 'user',
+            content: message
+          }
+        ]
       })
     });
-  } catch (_) {
-    return sendJson(res, 502, { error: 'Could not reach Claude. Check network or deployment logs.' });
+
+    const raw = await claudeResponse.text();
+
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!claudeResponse.ok) {
+      const detail = data?.error?.message || raw || `HTTP ${claudeResponse.status}`;
+      return sendJson(res, 200, {
+        text: `Claude is reachable but rejected the request: ${detail}`
+      });
+    }
+
+    const answer = Array.isArray(data?.content)
+      ? data.content
+          .filter(block => block?.type === 'text')
+          .map(block => block.text)
+          .join('\n')
+          .trim()
+      : '';
+
+    return sendJson(res, 200, {
+      text: answer || basicFallback(message)
+    });
+  } catch {
+    return sendJson(res, 200, {
+      text: basicFallback(message)
+    });
   }
-
-  let data = null;
-  const raw = await anthropicResponse.text();
-  try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
-
-  if (!anthropicResponse.ok) {
-    const detail = data?.error?.message || raw || `Claude returned HTTP ${anthropicResponse.status}`;
-    return sendJson(res, anthropicResponse.status, { error: detail });
-  }
-
-  const answer = Array.isArray(data?.content)
-    ? data.content.filter(block => block?.type === 'text').map(block => block.text).join('\n').trim()
-    : '';
-
-  if (!answer) return sendJson(res, 502, { error: 'Claude returned an empty response.' });
-
-  return sendJson(res, 200, { text: answer });
 };
