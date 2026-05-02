@@ -125,9 +125,20 @@ module.exports = async function handler(req, res) {
     return sendJson(res, 400, { error: 'Invalid JSON request.' });
   }
 
-  const message = text(body?.message, 1200);
+  const message = text(
+    body?.message ||
+    body?.prompt ||
+    body?.text ||
+    body?.input ||
+    body?.question ||
+    body?.userMessage ||
+    body?.contents?.[0]?.parts?.map(p => p.text).join('\n') ||
+    body?.messages?.[body.messages.length - 1]?.content ||
+    '',
+    1200
+  );
   const menu = sanitizeMenu(body?.menu);
-  const history = sanitizeHistory(body?.history);
+  const history = sanitizeHistory(body?.history || body?.messages || []);
 
   if (!message) return sendJson(res, 400, { error: 'Missing message.' });
   if (!history.length || history[history.length - 1].content !== message) {
