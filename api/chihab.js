@@ -156,6 +156,10 @@ function basicFallback(message) {
     return 'For You opens at 3 PM every day. It closes at 12:30 AM from Monday to Thursday, 1 AM on Sunday, and 2 AM on Friday and Saturday.';
   }
 
+  if (m.includes('weather')) {
+    return 'I do not have live weather access inside this restaurant assistant, but I can suggest something warm, cold, light, or filling from the menu.';
+  }
+
   if (m.includes('chicken')) {
     return 'For chicken options, tell me your budget and whether you want something light or filling. You can also check the Menu tab for the exact available chicken items and prices.';
   }
@@ -167,16 +171,112 @@ function basicFallback(message) {
   return 'I can help you choose from the For You menu. Tell me your budget, what you like, and what you want to avoid.';
 }
 
-function buildPrompt({ message, menu, language }) {
+function formatRecommendationIntelligence(analytics) {
+  const intelligence = analytics?.recommendationIntelligence || {};
+
+  const topItems = Array.isArray(intelligence.topItems)
+    ? intelligence.topItems
+        .slice(0, 8)
+        .map(x => `${x.name} (${x.qty || x.orders || x.count || 0})`)
+        .join(', ')
+    : '';
+
+  const commonPairings = Array.isArray(intelligence.commonPairings)
+    ? intelligence.commonPairings
+        .slice(0, 8)
+        .map(x => `${Array.isArray(x.items) ? x.items.join(' + ') : x.pair} (${x.count || 0})`)
+        .join('; ')
+    : '';
+
+  const categoryUpsells = intelligence.categoryUpsells
+    ? Object.entries(intelligence.categoryUpsells)
+        .slice(0, 8)
+        .map(([category, items]) => {
+          const names = Array.isArray(items)
+            ? items
+                .slice(0, 4)
+                .map(x => `${x.item || x.name} (${x.count || 0})`)
+                .join(', ')
+            : '';
+
+          return `${category}: ${names}`;
+        })
+        .join('\n')
+    : '';
+
+  const weekendFavorites = Array.isArray(intelligence.weekendFavorites)
+    ? intelligence.weekendFavorites
+        .slice(0, 6)
+        .map(x => `${x.name} (${x.count || 0})`)
+        .join(', ')
+    : '';
+
+  const lateNightFavorites = Array.isArray(intelligence.lateNightFavorites)
+    ? intelligence.lateNightFavorites
+        .slice(0, 6)
+        .map(x => `${x.name} (${x.count || 0})`)
+        .join(', ')
+    : '';
+
+  const budgetFavorites = Array.isArray(intelligence.budgetFavorites)
+    ? intelligence.budgetFavorites
+        .slice(0, 6)
+        .map(x => `${x.name} (${x.count || 0})`)
+        .join(', ')
+    : '';
+
+  return [
+    `Dataset size: ${intelligence.datasetSize || 'not provided'}`,
+    `Top items: ${topItems || 'not provided'}`,
+    `Common pairings: ${commonPairings || 'not provided'}`,
+    `Category upsells:\n${categoryUpsells || 'not provided'}`,
+    `Weekend favorites: ${weekendFavorites || 'not provided'}`,
+    `Late-night favorites: ${lateNightFavorites || 'not provided'}`,
+    `Budget favorites: ${budgetFavorites || 'not provided'}`
+  ].join('\n');
+}
+
+function buildPrompt({ message, menu, language, analytics }) {
   return [
     'You are Chihab, a warm and concise AI assistant for For You Restaurant in Ifrane, Morocco.',
     `Reply in ${toText(language, 40) || 'English'} unless the customer clearly uses another language.`,
-    'Recommend only from the provided menu. Do not invent dishes, prices, ingredients, promotions, or hours.',
-    'Restaurant hours: opens 3 PM daily. Closes 12:30 AM Mon-Thu, 1 AM Sunday, 2 AM Fri-Sat.',
+    '',
+    'ROLE:',
+    'You are a restaurant assistant, not a general chatbot.',
+    'Help with menu recommendations, ingredients, prices, opening hours, delivery, payment, order tracking, and realistic upselling.',
+    '',
+    'UNRELATED QUESTIONS:',
+    'If the user asks about weather, news, politics, homework, sports scores, medical advice, or other unrelated topics, do not pretend to have live access.',
+    'Reply briefly and politely, then redirect to restaurant help.',
+    'Example: “I do not have live weather access here, but I can suggest something warm, cold, light, or filling from the menu.”',
+    '',
+    'RESTAURANT FACTS:',
+    'For You Restaurant is in Ifrane, Morocco.',
+    'Opening hours: opens 3 PM daily. Closes 12:30 AM Monday to Thursday, 1 AM Sunday, and 2 AM Friday and Saturday.',
     'Payment: cash or card at delivery. Prices are in MAD.',
-    'Keep replies short and practical. For recommendations, suggest 2 to 4 items with brief reasons.',
+    '',
+    'MENU RULES:',
+    'Recommend only exact menu items from the provided menu.',
+    'Do not invent dishes, prices, ingredients, promotions, or availability.',
+    'Respect restrictions like no cheese, no shrimp, spicy, light, filling, budget, sweet, salty, etc.',
+    '',
+    'RECOMMENDATION LOGIC:',
+    'Use the order intelligence below when available. If no intelligence is provided, use menu logic.',
+    'For burgers and sandwiches, suggest realistic add-ons like fries, onion rings, soda, or milkshake.',
+    'For sushi, suggest soda, juice, tea, or lighter desserts.',
+    'For loaded fries and loaded mac, suggest soda, cheese sides, or milkshake.',
+    'Avoid weird pairings such as mint tea with burgers unless the user specifically asks for tea.',
+    '',
+    'ANSWER FORMAT:',
+    'Always answer in complete sentences.',
+    'Never stop mid-sentence.',
+    'Keep the answer short but complete.',
+    'If recommending items, give 2 to 4 options maximum.',
+    'Do not use markdown tables.',
     '',
     `MENU:\n${menu}`,
+    '',
+    `ORDER INTELLIGENCE:\n${formatRecommendationIntelligence(analytics)}`,
     '',
     `CUSTOMER MESSAGE:\n${message}`
   ].join('\n');
@@ -243,8 +343,8 @@ async function tryGeminiModel({ apiKey, model, prompt }) {
         }
       ],
       generationConfig: {
-        temperature: 0.45,
-        maxOutputTokens: 350
+        temperature: 0.35,
+        maxOutputTokens: 700
       }
     })
   });
@@ -352,10 +452,12 @@ module.exports = async function handler(req, res) {
   }
 
   const menu = buildMenuText(body?.menu);
+
   const prompt = buildPrompt({
     message,
     menu,
-    language: body?.language
+    language: body?.language,
+    analytics: body?.analytics || {}
   });
 
   try {
