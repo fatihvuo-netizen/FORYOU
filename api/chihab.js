@@ -1,7 +1,6 @@
 // Chihab AI - Gemini Vercel serverless endpoint
 // Required Vercel Environment Variable: GEMINI_API_KEY
 // Optional Vercel Environment Variable: GEMINI_MODEL
-// Recommended optional value: gemini-2.0-flash
 
 const PREFERRED_MODELS = [
   process.env.GEMINI_MODEL,
@@ -63,22 +62,11 @@ function toText(value, max = 1200) {
   }
 
   if (Array.isArray(value)) {
-    return value
-      .map(item => toText(item, max))
-      .filter(Boolean)
-      .join('\n')
-      .slice(0, max);
+    return value.map(x => toText(x, max)).filter(Boolean).join('\n').slice(0, max);
   }
 
   if (typeof value === 'object') {
-    return toText(
-      value.text ||
-      value.content ||
-      value.message ||
-      value.value ||
-      '',
-      max
-    );
+    return toText(value.text || value.content || value.message || value.value || '', max);
   }
 
   return '';
@@ -93,14 +81,7 @@ function extractMessage(body) {
     body?.question,
     body?.userMessage,
     body?.content,
-    body?.query,
-    body?.contents?.[0]?.parts,
-    Array.isArray(body?.messages)
-      ? body.messages[body.messages.length - 1]?.content
-      : '',
-    Array.isArray(body?.history)
-      ? body.history[body.history.length - 1]?.content
-      : ''
+    body?.query
   ];
 
   for (const candidate of candidates) {
@@ -111,125 +92,151 @@ function extractMessage(body) {
   return '';
 }
 
-function buildMenuText(menu) {
+function normalize(value) {
+  return String(value || '').toLowerCase();
+}
+
+function detectForbiddenTerms(message) {
+  const m = normalize(message);
+  const forbidden = [];
+
+  function add(term, patterns) {
+    if (patterns.some(p => m.includes(p))) forbidden.push(term);
+  }
+
+  add('fries', ['hate fries', 'no fries', 'without fries', "don't want fries", 'do not want fries', "don't like fries", 'do not like fries', 'sans frites', 'pas de frites']);
+  add('cheese', ['hate cheese', 'no cheese', 'without cheese', "don't want cheese", 'do not want cheese', "don't like cheese", 'do not like cheese', 'sans fromage', 'pas de fromage']);
+  add('shrimp', ['hate shrimp', 'no shrimp', 'without shrimp', "don't want shrimp", 'do not want shrimp', 'sans crevette', 'pas de crevette']);
+  add('spicy', ['not spicy', 'no spicy', 'without spicy', 'hate spicy', 'pas piquant', 'pas épicé', 'sans piquant']);
+  add('meat', ['no meat', 'without meat', 'vegetarian', 'veggie', 'sans viande', 'végétarien']);
+
+  return [...new Set(forbidden)];
+}
+
+function itemContainsForbidden(item, forbiddenTerms) {
+  if (!forbiddenTerms.length) return false;
+
+  const text = normalize([
+    item?.name,
+    item?.category,
+    item?.desc,
+    item?.description,
+    Array.isArray(item?.ingredients) ? item.ingredients.join(' ') : ''
+  ].filter(Boolean).join(' '));
+
+  return forbiddenTerms.some(term => {
+    if (term === 'fries') return text.includes('fries') || text.includes('frites') || text.includes('loaded fries');
+    if (term === 'cheese') return text.includes('cheese') || text.includes('fromage') || text.includes('cheddar') || text.includes('mozzarella');
+    if (term === 'shrimp') return text.includes('shrimp') || text.includes('crevette');
+    if (term === 'spicy') return text.includes('spicy') || text.includes('volcano') || text.includes('hot') || text.includes('piquant');
+    if (term === 'meat') return text.includes('beef') || text.includes('chicken') || text.includes('turkey') || text.includes('shawarma') || text.includes('meat') || text.includes('viande');
+    return text.includes(term);
+  });
+}
+
+function buildMenuText(menu, message = '') {
   if (!Array.isArray(menu) || menu.length === 0) {
     return 'No menu data was sent by the website.';
   }
 
-  return menu
-    .slice(0, 120)
-    .map(item => {
-      const name = toText(item?.name, 80);
-      if (!name) return '';
+  const forbiddenTerms = detectForbiddenTerms(message);
 
-      const category = toText(item?.category, 50);
+  const filtered = menu
+    .filter(item => item && item.name && item.available !== false)
+    .filter(item => !itemContainsForbidden(item, forbiddenTerms));
 
-      const price = Number.isFinite(Number(item?.price))
-        ? `${Number(item.price)} MAD`
-        : 'price not provided';
+  const source = filtered.length ? filtered : menu.filter(item => item && item.name);
+  const grouped = {};
 
-      const ingredients = Array.isArray(item?.ingredients)
-        ? item.ingredients
-            .slice(0, 8)
-            .map(x => toText(x, 30))
-            .filter(Boolean)
-            .join(', ')
-        : '';
+  source.slice(0, 180).forEach(item => {
+    const category = toText(item?.category || 'Other', 60);
+    if (!grouped[category]) grouped[category] = [];
 
-      const desc = toText(item?.desc || item?.description, 120);
-      const availability = item?.available === false ? 'UNAVAILABLE' : 'AVAILABLE';
+    const name = toText(item?.name, 80);
+    const price = Number.isFinite(Number(item?.price)) ? `${Number(item.price)} MAD` : 'price not provided';
+    const ingredients = Array.isArray(item?.ingredients)
+      ? item.ingredients.slice(0, 8).map(x => toText(x, 30)).filter(Boolean).join(', ')
+      : '';
+    const desc = toText(item?.desc || item?.description, 130);
 
-      return `${availability} | ${name} | ${category} | ${price} | ${ingredients} | ${desc}`;
-    })
-    .filter(Boolean)
-    .join('\n');
+    grouped[category].push(`${name} | ${price} | ${ingredients} | ${desc}`);
+  });
+
+  const menuText = Object.entries(grouped)
+    .map(([category, items]) => `CATEGORY: ${category}\n${items.join('\n')}`)
+    .join('\n\n');
+
+  if (!forbiddenTerms.length) return menuText;
+
+  return [
+    `CUSTOMER RESTRICTIONS DETECTED: Avoid ${forbiddenTerms.join(', ')}.`,
+    'The menu below was filtered to reduce conflicting items.',
+    '',
+    menuText
+  ].join('\n');
 }
 
 function basicFallback(message) {
-  const m = message.toLowerCase();
+  const m = normalize(message);
 
-  if (m.includes('hi') || m.includes('hello') || m.includes('salut') || m.includes('salam')) {
-    return 'Hi, welcome to For You Restaurant. Tell me your budget, what you like, or what you want to avoid, and I will suggest something from the menu.';
+  if (m.includes('weather')) {
+    return 'I do not have live weather access here, but I can help you choose something warm, cold, light, or filling from the menu.';
   }
 
   if (m.includes('hour') || m.includes('open') || m.includes('close')) {
     return 'For You opens at 3 PM every day. It closes at 12:30 AM from Monday to Thursday, 1 AM on Sunday, and 2 AM on Friday and Saturday.';
   }
 
-  if (m.includes('weather')) {
-    return 'I do not have live weather access inside this restaurant assistant, but I can suggest something warm, cold, light, or filling from the menu.';
-  }
-
-  if (m.includes('chicken')) {
-    return 'For chicken options, tell me your budget and whether you want something light or filling. You can also check the Menu tab for the exact available chicken items and prices.';
-  }
-
-  if (m.includes('cheese')) {
-    return 'Got it — no cheese. Tell me your budget and what type of food you want, and I will help narrow it down.';
-  }
-
-  return 'I can help you choose from the For You menu. Tell me your budget, what you like, and what you want to avoid.';
+  return 'I can help with the For You menu, recommendations, prices, ingredients, orders, and delivery.';
 }
 
 function formatRecommendationIntelligence(analytics) {
   const intelligence = analytics?.recommendationIntelligence || {};
 
   const topItems = Array.isArray(intelligence.topItems)
-    ? intelligence.topItems
-        .slice(0, 8)
-        .map(x => `${x.name} (${x.qty || x.orders || x.count || 0})`)
-        .join(', ')
+    ? intelligence.topItems.slice(0, 10).map(x => `${x.name} (${x.qty || x.orders || x.count || 0})`).join(', ')
     : '';
 
   const commonPairings = Array.isArray(intelligence.commonPairings)
-    ? intelligence.commonPairings
-        .slice(0, 8)
-        .map(x => `${Array.isArray(x.items) ? x.items.join(' + ') : x.pair} (${x.count || 0})`)
-        .join('; ')
+    ? intelligence.commonPairings.slice(0, 10).map(x => `${Array.isArray(x.items) ? x.items.join(' + ') : x.pair} (${x.count || 0})`).join('; ')
     : '';
 
   const categoryUpsells = intelligence.categoryUpsells
-    ? Object.entries(intelligence.categoryUpsells)
-        .slice(0, 8)
-        .map(([category, items]) => {
-          const names = Array.isArray(items)
-            ? items
-                .slice(0, 4)
-                .map(x => `${x.item || x.name} (${x.count || 0})`)
-                .join(', ')
-            : '';
-
-          return `${category}: ${names}`;
-        })
-        .join('\n')
+    ? Object.entries(intelligence.categoryUpsells).slice(0, 10).map(([category, items]) => {
+        const names = Array.isArray(items)
+          ? items.slice(0, 5).map(x => `${x.item || x.name} (${x.count || 0})`).join(', ')
+          : '';
+        return `${category}: ${names}`;
+      }).join('\n')
     : '';
 
   const weekendFavorites = Array.isArray(intelligence.weekendFavorites)
-    ? intelligence.weekendFavorites
-        .slice(0, 6)
-        .map(x => `${x.name} (${x.count || 0})`)
-        .join(', ')
+    ? intelligence.weekendFavorites.slice(0, 8).map(x => `${x.name} (${x.count || 0})`).join(', ')
     : '';
 
   const lateNightFavorites = Array.isArray(intelligence.lateNightFavorites)
-    ? intelligence.lateNightFavorites
-        .slice(0, 6)
-        .map(x => `${x.name} (${x.count || 0})`)
-        .join(', ')
+    ? intelligence.lateNightFavorites.slice(0, 8).map(x => `${x.name} (${x.count || 0})`).join(', ')
     : '';
 
   const budgetFavorites = Array.isArray(intelligence.budgetFavorites)
-    ? intelligence.budgetFavorites
-        .slice(0, 6)
-        .map(x => `${x.name} (${x.count || 0})`)
-        .join(', ')
+    ? intelligence.budgetFavorites.slice(0, 8).map(x => `${x.name} (${x.count || 0})`).join(', ')
     : '';
 
+  const hasData = topItems || commonPairings || categoryUpsells || weekendFavorites || lateNightFavorites || budgetFavorites;
+
+  if (!hasData) {
+    return [
+      'Manager analytics were not sent in this request.',
+      'Do not tell the customer you lack popularity data.',
+      'Use menu knowledge and sensible restaurant pairing logic confidently.'
+    ].join('\n');
+  }
+
   return [
-    `Dataset size: ${intelligence.datasetSize || 'not provided'}`,
-    `Top items: ${topItems || 'not provided'}`,
-    `Common pairings: ${commonPairings || 'not provided'}`,
-    `Category upsells:\n${categoryUpsells || 'not provided'}`,
+    `Historical dataset size: ${intelligence.datasetSize || 'not provided'} valid orders`,
+    `Popular items: ${topItems || 'not provided'}`,
+    `Association rules / common pairings: ${commonPairings || 'not provided'}`,
+    `Upselling by category:\n${categoryUpsells || 'not provided'}`,
     `Weekend favorites: ${weekendFavorites || 'not provided'}`,
     `Late-night favorites: ${lateNightFavorites || 'not provided'}`,
     `Budget favorites: ${budgetFavorites || 'not provided'}`
@@ -237,46 +244,53 @@ function formatRecommendationIntelligence(analytics) {
 }
 
 function buildPrompt({ message, menu, language, analytics }) {
+  const forbiddenTerms = detectForbiddenTerms(message);
+  const m = normalize(message);
+
   return [
-    'You are Chihab, a warm and concise AI assistant for For You Restaurant in Ifrane, Morocco.',
+    'You are Chihab, the smart restaurant assistant for For You Restaurant in Ifrane, Morocco.',
     `Reply in ${toText(language, 40) || 'English'} unless the customer clearly uses another language.`,
     '',
-    'ROLE:',
-    'You are a restaurant assistant, not a general chatbot.',
-    'Help with menu recommendations, ingredients, prices, opening hours, delivery, payment, order tracking, and realistic upselling.',
+    'MAIN RULE:',
+    'Answer food, menu, price, ingredient, recommendation, upselling, order, delivery, and opening-hour questions fully.',
+    'For unrelated topics such as sports, politics, news, homework, general trivia, or live weather, briefly say you are focused on restaurant help and redirect to food or orders.',
     '',
-    'UNRELATED QUESTIONS:',
-    'If the user asks about weather, news, politics, homework, sports scores, medical advice, or other unrelated topics, do not pretend to have live access.',
-    'Reply briefly and politely, then redirect to restaurant help.',
-    'Example: “I do not have live weather access here, but I can suggest something warm, cold, light, or filling from the menu.”',
+    'INTENT RULE:',
+    'If the customer asks “what can I eat?”, “recommend something”, “I am hungry”, “something filling”, “what is good?”, or similar, give food recommendations. Do not answer with opening hours unless they ask about hours.',
+    `Customer message lowercased: ${m}`,
+    '',
+    'CUSTOMER PREFERENCE RULE:',
+    'Dislikes and restrictions are mandatory. Never recommend something the customer says they hate or do not want.',
+    `Detected restrictions: ${forbiddenTerms.length ? forbiddenTerms.join(', ') : 'none'}.`,
     '',
     'RESTAURANT FACTS:',
-    'For You Restaurant is in Ifrane, Morocco.',
+    'Location: Ifrane, Morocco.',
     'Opening hours: opens 3 PM daily. Closes 12:30 AM Monday to Thursday, 1 AM Sunday, and 2 AM Friday and Saturday.',
     'Payment: cash or card at delivery. Prices are in MAD.',
     '',
     'MENU RULES:',
-    'Recommend only exact menu items from the provided menu.',
-    'Do not invent dishes, prices, ingredients, promotions, or availability.',
-    'Respect restrictions like no cheese, no shrimp, spicy, light, filling, budget, sweet, salty, etc.',
+    'Recommend only exact items from the provided menu.',
+    'Do not invent dishes, prices, ingredients, discounts, promotions, or availability.',
+    'Use the whole menu and diversify suggestions. Do not always recommend the same category.',
     '',
-    'RECOMMENDATION LOGIC:',
-    'Use the order intelligence below when available. If no intelligence is provided, use menu logic.',
-    'For burgers and sandwiches, suggest realistic add-ons like fries, onion rings, soda, or milkshake.',
-    'For sushi, suggest soda, juice, tea, or lighter desserts.',
-    'For loaded fries and loaded mac, suggest soda, cheese sides, or milkshake.',
-    'Avoid weird pairings such as mint tea with burgers unless the user specifically asks for tea.',
+    'ANALYTICS AND UPSELLING RULE:',
+    'Use the historical analytics and association rules when provided.',
+    'If analytics are provided, treat them as the restaurant’s historical order data.',
+    'If analytics are missing, do not mention that to the customer. Use sensible menu logic.',
+    'For burgers/sandwiches, realistic add-ons are onion rings, soda, or milkshake. Fries only if the customer did not reject fries.',
+    'For sushi, realistic add-ons are soda, juice, tea, or light dessert.',
+    'For loaded fries/loaded mac, realistic add-ons are soda, cheese sides, or milkshake unless rejected.',
     '',
-    'ANSWER FORMAT:',
-    'Always answer in complete sentences.',
-    'Never stop mid-sentence.',
-    'Keep the answer short but complete.',
-    'If recommending items, give 2 to 4 options maximum.',
-    'Do not use markdown tables.',
+    'ANSWER STYLE:',
+    'Be direct and helpful.',
+    'Give 2 to 4 options maximum.',
+    'Each recommendation should include price and a short reason.',
+    'Always finish the sentence.',
+    'No markdown tables.',
     '',
     `MENU:\n${menu}`,
     '',
-    `ORDER INTELLIGENCE:\n${formatRecommendationIntelligence(analytics)}`,
+    `HISTORICAL ANALYTICS / UPSELLING DATA:\n${formatRecommendationIntelligence(analytics)}`,
     '',
     `CUSTOMER MESSAGE:\n${message}`
   ].join('\n');
@@ -297,9 +311,7 @@ async function listUsableGeminiModels(apiKey) {
       data = null;
     }
 
-    if (!response.ok || !Array.isArray(data?.models)) {
-      return [];
-    }
+    if (!response.ok || !Array.isArray(data?.models)) return [];
 
     return data.models
       .filter(model =>
@@ -316,7 +328,6 @@ async function listUsableGeminiModels(apiKey) {
           if (name.includes('pro')) return 4;
           return 9;
         };
-
         return score(a) - score(b);
       });
   } catch {
@@ -332,9 +343,7 @@ async function tryGeminiModel({ apiKey, model, prompt }) {
 
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json'
-    },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       contents: [
         {
@@ -343,8 +352,8 @@ async function tryGeminiModel({ apiKey, model, prompt }) {
         }
       ],
       generationConfig: {
-        temperature: 0.35,
-        maxOutputTokens: 700
+        temperature: 0.2,
+        maxOutputTokens: 900
       }
     })
   });
@@ -359,22 +368,14 @@ async function tryGeminiModel({ apiKey, model, prompt }) {
   }
 
   if (!response.ok) {
-    const detail =
-      data?.error?.message ||
-      data?.error?.status ||
-      raw ||
-      `HTTP ${response.status}`;
-
+    const detail = data?.error?.message || data?.error?.status || raw || `HTTP ${response.status}`;
     throw new Error(`${cleanModel}: ${detail}`);
   }
 
-  const answer =
-    data?.candidates?.[0]?.content?.parts
-      ?.map(part => part?.text || '')
-      .join('\n')
-      .trim() || '';
-
-  return answer;
+  return data?.candidates?.[0]?.content?.parts
+    ?.map(part => part?.text || '')
+    .join('\n')
+    .trim() || '';
 }
 
 async function callGemini({ apiKey, prompt }) {
@@ -393,19 +394,13 @@ async function callGemini({ apiKey, prompt }) {
   for (const model of modelsToTry) {
     try {
       const answer = await tryGeminiModel({ apiKey, model, prompt });
-
-      if (answer) {
-        return answer;
-      }
+      if (answer) return answer;
     } catch (error) {
       lastError = error;
     }
   }
 
-  throw new Error(
-    lastError?.message ||
-    'No usable Gemini model was found for this API key.'
-  );
+  throw new Error(lastError?.message || 'No usable Gemini model was found for this API key.');
 }
 
 module.exports = async function handler(req, res) {
@@ -451,7 +446,7 @@ module.exports = async function handler(req, res) {
     });
   }
 
-  const menu = buildMenuText(body?.menu);
+  const menu = buildMenuText(body?.menu, message);
 
   const prompt = buildPrompt({
     message,
