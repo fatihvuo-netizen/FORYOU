@@ -353,7 +353,7 @@ async function tryGeminiModel({ apiKey, model, prompt }) {
       ],
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 900
+        maxOutputTokens: 1200
       }
     })
   });
